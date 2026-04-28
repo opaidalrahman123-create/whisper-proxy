@@ -1,1 +1,6 @@
+flask
+flask-cors
+groq
+youtube-transcript-api
 yt-dlp
+requests
