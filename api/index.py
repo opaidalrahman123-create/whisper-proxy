@@ -1,6 +1,13 @@
 from http.server import BaseHTTPRequestHandler
-import json, urllib.request, subprocess, os, tempfile, re
-from youtube_transcript_api import YouTubeTranscriptApi
+import json, urllib.request, urllib.error, urllib.parse, os, tempfile, re, io
+
+# youtube_transcript_api متاحة على Vercel عبر requirements.txt
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    HAS_TRANSCRIPT_API = True
+except ImportError:
+    HAS_TRANSCRIPT_API = False
+
 
 class handler(BaseHTTPRequestHandler):
 
@@ -12,29 +19,29 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(length))
-            
-            url = body.get('url', '').strip()
-            groq_key = body.get('groq_key', '').strip()
-            action = body.get('action', 'summary') # نوع المهمة المطلوبة
+            body   = json.loads(self.rfile.read(length))
+
+            url       = body.get('url', '').strip()
+            groq_key  = body.get('groq_key', '').strip()
+            action    = body.get('action', 'summary')
 
             if not url or not groq_key:
                 return self._json(400, {'error': 'يرجى إدخال الرابط ومفتاح Groq'})
 
             video_id = self._extract_id(url)
-            
-            # 1. جلب بيانات الفيديو (الوصف، القناة، التعليق المثبت) عبر yt-dlp
-            # هذه الميزة التي طلبت الحفاظ عليها
-            metadata = self._get_metadata(url)
-            
-            # 2. استخراج النص (الأولوية لـ Transcript API ثم Whisper)
+            if not video_id:
+                return self._json(400, {'error': 'رابط يوتيوب غير صالح'})
+
+            # 1. بيانات الفيديو — بدون yt-dlp (نستخدم YouTube oEmbed API مجاناً)
+            metadata = self._get_metadata_oembed(video_id)
+
+            # 2. استخراج النص (Transcript API → Whisper)
             transcript_text = self._get_full_text(url, video_id, groq_key)
 
             if not transcript_text:
-                return self._json(400, {'error': 'تعذر استخراج نص من هذا الفيديو'})
+                return self._json(400, {'error': 'تعذّر استخراج نص من هذا الفيديو. تأكد أن الفيديو يحتوي على ترجمة أو أن مفتاح Groq صحيح.'})
 
-            # 3. المعالجة النهائية عبر Groq (Llama 3.3 70B)
-            # ندمج الوصف والتعليق المثبت مع النص ليعطي الـ AI أدق نتيجة
+            # 3. معالجة عبر Groq Llama 3.3
             final_result = self._process_with_llama(transcript_text, metadata, action, groq_key)
 
             return self._json(200, {'result': final_result, 'metadata': metadata})
@@ -42,89 +49,213 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {'error': str(e)})
 
-    def _extract_id(self, url):
-        match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', url)
-        return match.group(1) if match else None
+    # ─────────────────────────────────────────────
+    # مساعدات
+    # ─────────────────────────────────────────────
 
-    def _get_metadata(self, url):
-        """استخدام yt-dlp لجلب البيانات الوصفية والتعليق المثبت"""
+    def _extract_id(self, url):
+        patterns = [
+            r'(?:v=|youtu\.be/|embed/|shorts/|live/)([0-9A-Za-z_-]{11})',
+        ]
+        for p in patterns:
+            m = re.search(p, url)
+            if m:
+                return m.group(1)
+        return None
+
+    def _get_metadata_oembed(self, video_id):
+        """جلب عنوان القناة واسم الفيديو عبر YouTube oEmbed — لا يحتاج API key"""
         try:
-            cmd = [
-                'yt-dlp', '--dump-json', '--no-playlist', 
-                '--get-comments', '--comment-sort', 'top', 
-                '--max-comments', '5', url
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            
-            # استخراج التعليق المثبت (غالباً يكون الأول إذا رتبنا حسب الـ top)
-            comments = data.get('comments', [])
-            pinned = comments[0]['text'] if comments else "لا يوجد تعليق مثبت"
-            
+            oembed_url = f'https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json'
+            with urllib.request.urlopen(oembed_url, timeout=8) as r:
+                data = json.loads(r.read().decode('utf-8'))
             return {
-                'title': data.get('title'),
-                'description': data.get('description', '')[:500], # أول 500 حرف
-                'channel': data.get('uploader'),
-                'pinned_comment': pinned
+                'title':         data.get('title', 'فيديو يوتيوب'),
+                'channel':       data.get('author_name', 'غير معروف'),
+                'description':   '',
+                'pinned_comment': ''
             }
         except:
-            return {'title': 'فيديو يوتيوب', 'description': '', 'channel': 'غير معروف', 'pinned_comment': ''}
+            return {'title': 'فيديو يوتيوب', 'channel': 'غير معروف', 'description': '', 'pinned_comment': ''}
 
     def _get_full_text(self, url, video_id, groq_key):
-        """محاولة جلب الترجمة أولاً، وإذا فشلت نستخدم Whisper"""
-        # محاولة YouTubeTranscriptApi
-        try:
-            ts = YouTubeTranscriptApi.get_transcript(video_id, languages=['ar', 'en'])
-            return " ".join([i['text'] for i in ts])
-        except:
-            # إذا فشلت، نستخدم نظام Whisper القديم الخاص بك (تحميل الصوت)
-            return self._whisper_fallback(url, groq_key)
+        """محاولة YouTubeTranscriptApi أولاً ثم Whisper"""
+        # ── محاولة 1: Transcript API ──
+        if HAS_TRANSCRIPT_API:
+            try:
+                ts = YouTubeTranscriptApi.get_transcript(video_id, languages=['ar', 'ar-SA', 'en'])
+                text = " ".join(i['text'] for i in ts)
+                if text.strip():
+                    return text
+            except:
+                pass
 
-    def _whisper_fallback(self, url, groq_key):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, 'audio.%(ext)s')
-            subprocess.run(['yt-dlp', '-x', '--audio-format', 'mp3', '-o', out, url], capture_output=True)
-            mp3 = os.path.join(tmp, 'audio.mp3')
-            if not os.path.exists(mp3): return None
-            
-            # إرسال لـ Whisper (نفس منطقك القديم)
-            with open(mp3, 'rb') as f:
-                audio_bytes = f.read()
-            
-            # (تم اختصار كود الـ Multipart هنا لضمان عمل السيرفر، هو نفس منطقك السابق تماماً)
-            # ... كود الإرسال لـ Groq Whisper ...
-            return "نص مستخرج عبر Whisper" # سيتم تعويضه بالنص الفعلي
+        # ── محاولة 2: Whisper عبر Groq ──
+        return self._whisper_fallback(video_id, groq_key)
+
+    def _whisper_fallback(self, video_id, groq_key):
+        """
+        تنزيل الصوت بدون yt-dlp:
+        نستخدم cobalt.tools API (مجاني، بدون مفتاح) لجلب رابط الصوت المباشر
+        ثم نرسله لـ Groq Whisper.
+        """
+        try:
+            audio_url = self._get_audio_url_cobalt(video_id)
+            if not audio_url:
+                return None
+
+            # تنزيل الصوت في الذاكرة (أقصى 25 MB لـ Whisper)
+            audio_bytes = self._download_bytes(audio_url, max_mb=24)
+            if not audio_bytes:
+                return None
+
+            # إرسال لـ Groq Whisper
+            return self._transcribe_with_groq(audio_bytes, groq_key)
+
+        except Exception as e:
+            return None
+
+    def _get_audio_url_cobalt(self, video_id):
+        """Cobalt.tools — واجهة مفتوحة لجلب روابط الصوت من يوتيوب"""
+        try:
+            yt_url = f'https://www.youtube.com/watch?v={video_id}'
+            payload = json.dumps({
+                'url': yt_url,
+                'downloadMode': 'audio',
+                'audioFormat': 'mp3',
+                'audioBitrate': '64'
+            }).encode('utf-8')
+
+            req = urllib.request.Request(
+                'https://api.cobalt.tools/',
+                data=payload,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0'
+                }
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode('utf-8'))
+
+            # cobalt يعيد {"status":"stream","url":"..."} أو {"status":"redirect","url":"..."}
+            status = data.get('status', '')
+            if status in ('stream', 'redirect', 'tunnel'):
+                return data.get('url')
+            # قد يعيد {"status":"picker","picker":[...]}
+            if status == 'picker':
+                items = data.get('picker', [])
+                if items:
+                    return items[0].get('url')
+        except:
+            pass
+        return None
+
+    def _download_bytes(self, url, max_mb=24):
+        """تنزيل بايتات مع حد أقصى للحجم"""
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                max_bytes = max_mb * 1024 * 1024
+                chunks = []
+                total = 0
+                while True:
+                    chunk = r.read(65536)  # 64 KB
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        break
+                    chunks.append(chunk)
+                return b''.join(chunks) if chunks else None
+        except:
+            return None
+
+    def _transcribe_with_groq(self, audio_bytes, groq_key):
+        """إرسال الصوت لـ Groq Whisper large-v3 وإرجاع النص"""
+        # بناء multipart/form-data يدوياً
+        boundary = b'----GroqWhisperBoundary7391'
+        body_parts = []
+
+        # حقل file
+        body_parts.append(b'--' + boundary)
+        body_parts.append(b'Content-Disposition: form-data; name="file"; filename="audio.mp3"')
+        body_parts.append(b'Content-Type: audio/mpeg')
+        body_parts.append(b'')
+        body_parts.append(audio_bytes)
+
+        # حقل model
+        body_parts.append(b'--' + boundary)
+        body_parts.append(b'Content-Disposition: form-data; name="model"')
+        body_parts.append(b'')
+        body_parts.append(b'whisper-large-v3-turbo')
+
+        # حقل response_format
+        body_parts.append(b'--' + boundary)
+        body_parts.append(b'Content-Disposition: form-data; name="response_format"')
+        body_parts.append(b'')
+        body_parts.append(b'json')
+
+        body_parts.append(b'--' + boundary + b'--')
+
+        body = b'\r\n'.join(body_parts)
+
+        req = urllib.request.Request(
+            'https://api.groq.com/openai/v1/audio/transcriptions',
+            data=body,
+            headers={
+                'Authorization': f'Bearer {groq_key}',
+                'Content-Type': f'multipart/form-data; boundary={boundary.decode()}'
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+            return result.get('text', '').strip() or None
 
     def _process_with_llama(self, text, meta, action, key):
-        """المعالجة النهائية عبر Llama 3.3 70B"""
+        """معالجة النص عبر Groq Llama 3.3 70B"""
         prompts = {
-            "summary": "قم بتلخيص الدرس التالي بأسلوب نقاط شامل ومنظم:",
-            "explain": "اشرح المفاهيم الصعبة في هذا الفيديو بأسلوب طالب ثانوية عامة:",
-            "mindmap": "أنشئ خريطة ذهنية Markdown مبنية على هذا المحتوى:",
-            "scientific": "استخرج القوانين والمعادلات والمادة العلمية فقط:"
+            'summary': 'قم بتلخيص الدرس التالي بأسلوب نقاط شامل ومنظم مع عناوين فرعية واضحة:',
+            'explain': 'اشرح المفاهيم والمعلومات في هذا الفيديو بأسلوب مبسط يناسب طالب الثانوية العامة، وأبرز ما يهم في الامتحانات:',
+            'extract': 'استخرج المادة العلمية الكاملة: القوانين، التعريفات، المعادلات، خطوات الحل، والمعلومات الجوهرية مرتبةً بشكل منظم:',
+            'mindmap': 'أنشئ خريطة ذهنية نصية منظمة بعناوين وتفرعات واضحة تغطي محتوى هذا الفيديو بالكامل:'
         }
-        
-        system_prompt = f"أنت مساعد تعليمي ذكي. بيانات الفيديو: العنوان({meta['title']})، القناة({meta['channel']})، الوصف({meta['description']})."
-        user_content = f"{prompts.get(action, prompts['summary'])}\n\nالنص:\n{text}"
+
+        system_prompt = (
+            f"أنت مساعد تعليمي ذكي لطالب الصف الثالث الثانوي المصري.\n"
+            f"بيانات الفيديو — العنوان: «{meta['title']}»، القناة: {meta['channel']}.\n"
+            f"أجب بالعربية دائماً بأسلوب منظم ومفيد."
+        )
+
+        user_content = f"{prompts.get(action, prompts['summary'])}\n\nالنص:\n{text[:14000]}"
 
         req_data = json.dumps({
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
+            'model': 'llama-3.3-70b-versatile',
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user',   'content': user_content}
             ],
-            "temperature": 0.5
+            'temperature': 0.4,
+            'max_tokens': 4096
         }).encode('utf-8')
 
         req = urllib.request.Request(
             'https://api.groq.com/openai/v1/chat/completions',
             data=req_data,
-            headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}
+            headers={
+                'Authorization': f'Bearer {key}',
+                'Content-Type': 'application/json'
+            }
         )
-        
-        with urllib.request.urlopen(req) as resp:
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
             res = json.loads(resp.read().decode('utf-8'))
             return res['choices'][0]['message']['content']
+
+    # ─────────────────────────────────────────────
+    # HTTP helpers
+    # ─────────────────────────────────────────────
 
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -136,7 +267,10 @@ class handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args): pass
+    def log_message(self, *args):
+        pass
+        
